@@ -1,0 +1,370 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#111827">
+  <title>Zeus Service Center - Cetak Thermal</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #f3f4f6; color: #111827; font-family: Arial, sans-serif; }
+    header { position: sticky; top: 0; z-index: 5; padding: 14px 16px; color: #fff; background: #111827; box-shadow: 0 2px 8px #0002; }
+    header strong { display: block; font-size: 16px; }
+    header small { display: block; margin-top: 3px; color: #d1d5db; }
+    main { max-width: 680px; margin: 0 auto; padding: 14px; }
+    .panel { background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 14px; box-shadow: 0 1px 3px #0000000d; }
+    #status { margin: 0 0 12px; padding: 11px 12px; border-radius: 8px; background: #eff6ff; color: #1d4ed8; font-size: 13px; line-height: 1.45; white-space: pre-wrap; }
+    #status.success { background: #ecfdf5; color: #047857; }
+    #status.error { background: #fef2f2; color: #b91c1c; }
+    #actions { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+    button { appearance: none; border: 0; border-radius: 8px; padding: 12px 14px; font-weight: 700; font-size: 14px; cursor: pointer; }
+    button:disabled { opacity: .55; cursor: wait; }
+    #btnConnect { background: #2563eb; color: #fff; }
+    #btnRetry { background: #e5e7eb; color: #111827; }
+    #previewWrap { overflow-x: auto; padding: 14px 8px; background: #e5e7eb; border-radius: 8px; }
+    #ticketRoot { display: flex; flex-direction: column; align-items: center; gap: 14px; min-height: 40px; }
+    .thermal-ticket { box-sizing: border-box; width: 53mm; max-width: 53mm; background: #fff; color: #000; }
+    .thermal-ticket img { max-width: 44mm; max-height: 35mm; object-fit: contain; }
+    .hint { margin: 12px 2px 0; color: #6b7280; font-size: 12px; line-height: 1.5; }
+    .hidden { display: none !important; }
+    @media (min-width: 600px) { main { padding-top: 24px; } }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+</head>
+<body>
+  <header>
+    <strong>ZEUS SERVICE CENTER</strong>
+    <small>Cetak nota Thermal 57 mm · Bluetooth RPP02N</small>
+  </header>
+  <main>
+    <section class="panel">
+      <div id="status">Menghubungkan halaman cetak dengan Zeus...</div>
+      <div id="actions">
+        <button id="btnConnect" type="button" class="hidden">Hubungkan RPP02N</button>
+        <button id="btnRetry" type="button" class="hidden">Coba Lagi</button>
+      </div>
+      <div id="previewWrap"><div id="ticketRoot"></div></div>
+      <p class="hint">Pertama kali: tekan Hubungkan RPP02N dan pilih printer pada daftar Chrome. Setelah izin tersimpan, cetak berikutnya dapat dikirim langsung dari Zeus. Halaman ini bukan aplikasi printer pihak ketiga; ini halaman cetak mandiri milik Zeus untuk melewati pembatasan iframe Google Apps Script.</p>
+    </section>
+  </main>
+
+<script>
+(() => {
+  'use strict';
+
+  const PRINTER_WIDTH_DOTS = 384;
+  const PRINTER_BAUD_RATE = 9600;
+  const CHANNEL = new URLSearchParams(location.search).get('channel') || '';
+
+  const statusEl = document.getElementById('status');
+  const ticketRoot = document.getElementById('ticketRoot');
+  const connectBtn = document.getElementById('btnConnect');
+  const retryBtn = document.getElementById('btnRetry');
+
+  let noteReady = false;
+  let printing = false;
+  let selectedPort = null;
+  let autoPrintStarted = false;
+  let htmlReceived = '';
+
+  function setStatus(message, tone = '') {
+    statusEl.textContent = message;
+    statusEl.className = tone;
+  }
+
+  function sendResult(ok, message) {
+    if (!window.opener || !CHANNEL) return;
+    try {
+      window.opener.postMessage({
+        type: 'ZEUS_PRINT_RESULT',
+        channel: CHANNEL,
+        ok: !!ok,
+        message: String(message || '')
+      }, '*');
+    } catch (error) {}
+  }
+
+  function serialAvailable() {
+    return !!(window.isSecureContext && navigator.serial &&
+      typeof navigator.serial.requestPort === 'function' &&
+      typeof navigator.serial.getPorts === 'function');
+  }
+
+  function sanitizeAndRender(html) {
+    const template = document.createElement('template');
+    template.innerHTML = String(html || '');
+    template.content.querySelectorAll('script, iframe, object, embed, link, meta').forEach(el => el.remove());
+    template.content.querySelectorAll('*').forEach(el => {
+      Array.from(el.attributes).forEach(attr => {
+        const name = attr.name.toLowerCase();
+        const value = String(attr.value || '').trim().toLowerCase();
+        if (name.startsWith('on')) el.removeAttribute(attr.name);
+        if ((name === 'href' || name === 'src') && value.startsWith('javascript:')) el.removeAttribute(attr.name);
+      });
+    });
+    ticketRoot.replaceChildren(template.content.cloneNode(true));
+    const tickets = Array.from(ticketRoot.querySelectorAll('.thermal-ticket'));
+    if (!tickets.length) throw new Error('Data nota tidak berisi elemen .thermal-ticket. Kembali ke Zeus dan buka ulang preview Thermal.');
+    return tickets;
+  }
+
+  function waitForImages(element) {
+    const images = Array.from(element.querySelectorAll('img'));
+    if (!images.length) return Promise.resolve();
+    return Promise.all(images.map(img => new Promise(resolve => {
+      if (img.complete) return resolve();
+      let finished = false;
+      const done = () => { if (finished) return; finished = true; resolve(); };
+      img.addEventListener('load', done, { once: true });
+      img.addEventListener('error', done, { once: true });
+      window.setTimeout(done, 4500);
+    })));
+  }
+
+  async function captureTicket(element) {
+    if (!window.html2canvas) throw new Error('Library perender nota belum termuat. Periksa koneksi internet lalu tekan Coba Lagi.');
+    await waitForImages(element);
+    const rect = element.getBoundingClientRect();
+    if (!rect.width || !rect.height) throw new Error('Ukuran nota tidak terbaca.');
+
+    const canvas = await window.html2canvas(element, {
+      backgroundColor: '#ffffff',
+      scale: PRINTER_WIDTH_DOTS / rect.width,
+      width: rect.width,
+      height: rect.height,
+      useCORS: true,
+      allowTaint: false,
+      logging: false,
+      scrollX: 0,
+      scrollY: 0,
+      windowWidth: Math.max(document.documentElement.clientWidth, Math.ceil(rect.width)),
+      windowHeight: Math.max(document.documentElement.clientHeight, Math.ceil(rect.height))
+    });
+
+    const outputHeight = Math.max(1, Math.round(canvas.height * PRINTER_WIDTH_DOTS / canvas.width));
+    const output = document.createElement('canvas');
+    output.width = PRINTER_WIDTH_DOTS;
+    output.height = outputHeight;
+    const ctx = output.getContext('2d', { willReadFrequently: true });
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, output.width, output.height);
+    ctx.drawImage(canvas, 0, 0, output.width, output.height);
+    return output;
+  }
+
+  function canvasToRaster(canvas) {
+    const width = canvas.width;
+    const height = canvas.height;
+    if (width !== PRINTER_WIDTH_DOTS) throw new Error('Lebar gambar cetak harus 384 dot.');
+    if (height > 65535) throw new Error('Nota terlalu panjang untuk satu perintah raster printer.');
+
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    const rgba = ctx.getImageData(0, 0, width, height).data;
+    const gray = new Float32Array(width * height);
+    for (let i = 0, p = 0; i < gray.length; i++, p += 4) {
+      const alpha = rgba[p + 3] / 255;
+      const r = rgba[p] * alpha + 255 * (1 - alpha);
+      const g = rgba[p + 1] * alpha + 255 * (1 - alpha);
+      const b = rgba[p + 2] * alpha + 255 * (1 - alpha);
+      gray[i] = 0.299 * r + 0.587 * g + 0.114 * b;
+    }
+
+    const widthBytes = Math.ceil(width / 8);
+    const bitmap = new Uint8Array(widthBytes * height);
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const index = y * width + x;
+        const oldValue = gray[index];
+        const newValue = oldValue < 185 ? 0 : 255;
+        const error = oldValue - newValue;
+        gray[index] = newValue;
+        if (x + 1 < width) gray[index + 1] += error * 7 / 16;
+        if (y + 1 < height) {
+          if (x > 0) gray[index + width - 1] += error * 3 / 16;
+          gray[index + width] += error * 5 / 16;
+          if (x + 1 < width) gray[index + width + 1] += error / 16;
+        }
+        if (newValue === 0) bitmap[y * widthBytes + (x >> 3)] |= (0x80 >> (x & 7));
+      }
+    }
+
+    const header = new Uint8Array([
+      0x1d, 0x76, 0x30, 0x00,
+      widthBytes & 0xff, (widthBytes >> 8) & 0xff,
+      height & 0xff, (height >> 8) & 0xff
+    ]);
+    const command = new Uint8Array(header.length + bitmap.length);
+    command.set(header, 0);
+    command.set(bitmap, header.length);
+    return command;
+  }
+
+  function joinBytes(parts) {
+    const total = parts.reduce((sum, part) => sum + part.length, 0);
+    const output = new Uint8Array(total);
+    let offset = 0;
+    for (const part of parts) { output.set(part, offset); offset += part.length; }
+    return output;
+  }
+
+  async function openPort(port) {
+    if (!port.readable && !port.writable) {
+      await port.open({
+        baudRate: PRINTER_BAUD_RATE,
+        dataBits: 8,
+        stopBits: 1,
+        parity: 'none',
+        flowControl: 'none'
+      });
+    }
+    selectedPort = port;
+    try {
+      port.addEventListener('disconnect', () => {
+        selectedPort = null;
+        setStatus('Koneksi RPP02N terputus. Tekan Hubungkan RPP02N untuk menyambungkan kembali.', 'error');
+        connectBtn.classList.remove('hidden');
+      }, { once: true });
+    } catch (error) {}
+  }
+
+  async function writeInChunks(port, bytes) {
+    if (!port.writable) throw new Error('Port printer tidak dapat ditulis. Hubungkan ulang printer.');
+    const writer = port.writable.getWriter();
+    try {
+      const chunkSize = 1024;
+      for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+        await writer.write(bytes.subarray(offset, Math.min(offset + chunkSize, bytes.length)));
+      }
+    } finally {
+      writer.releaseLock();
+    }
+  }
+
+  async function printTickets() {
+    if (!noteReady || printing) return;
+    if (!selectedPort) throw new Error('Printer belum terhubung.');
+    const tickets = Array.from(ticketRoot.querySelectorAll('.thermal-ticket'));
+    if (!tickets.length) throw new Error('Nota Thermal tidak ditemukan.');
+
+    printing = true;
+    connectBtn.disabled = true;
+    setStatus('Merender nota untuk RPP02N...', '');
+    try {
+      const commands = [new Uint8Array([0x1b, 0x40]), new Uint8Array([0x1b, 0x61, 0x00])];
+      for (let i = 0; i < tickets.length; i++) {
+        setStatus('Menyiapkan lembar ' + (i + 1) + ' dari ' + tickets.length + '...', '');
+        const canvas = await captureTicket(tickets[i]);
+        commands.push(canvasToRaster(canvas));
+        if (i < tickets.length - 1) commands.push(new Uint8Array([0x1b, 0x64, 0x03]));
+      }
+      commands.push(new Uint8Array([0x1b, 0x64, 0x04]));
+      const bytes = joinBytes(commands);
+      setStatus('Mengirim ' + bytes.length.toLocaleString('id-ID') + ' byte ke RPP02N...', '');
+      await writeInChunks(selectedPort, bytes);
+      setStatus('Nota berhasil dikirim ke RPP02N. Silakan sobek kertas pada garis potong.', 'success');
+      retryBtn.classList.add('hidden');
+      sendResult(true, 'Nota berhasil dikirim ke RPP02N.');
+    } catch (error) {
+      setStatus('Cetak gagal: ' + (error.message || error), 'error');
+      retryBtn.classList.remove('hidden');
+      sendResult(false, error.message || error);
+      connectBtn.classList.remove('hidden');
+    } finally {
+      printing = false;
+      connectBtn.disabled = false;
+    }
+  }
+
+  async function connectAndPrint() {
+    if (!serialAvailable()) {
+      setStatus('Web Serial tidak tersedia. Gunakan Chrome Android versi 137 atau lebih baru dan buka halaman ini langsung melalui HTTPS (bukan dari dalam iframe).', 'error');
+      return;
+    }
+    connectBtn.disabled = true;
+    connectBtn.textContent = 'Memilih printer...';
+    try {
+      // requestPort dipanggil langsung dari klik pengguna, sesuai aturan user activation.
+      const portPromise = navigator.serial.requestPort();
+      const port = await portPromise;
+      await openPort(port);
+      connectBtn.classList.add('hidden');
+      setStatus('RPP02N terhubung. Nota akan langsung dicetak...', 'success');
+      await printTickets();
+    } catch (error) {
+      if (error && error.name === 'NotFoundError') {
+        setStatus('Pemilihan printer dibatalkan. Tekan Hubungkan RPP02N untuk mencoba lagi.', 'error');
+      } else {
+        setStatus('Gagal menghubungkan printer: ' + (error.message || error), 'error');
+      }
+      connectBtn.classList.remove('hidden');
+    } finally {
+      connectBtn.disabled = false;
+      connectBtn.textContent = 'Hubungkan RPP02N';
+    }
+  }
+
+  async function prepareAndMaybePrint() {
+    if (!serialAvailable()) {
+      setStatus('Web Serial tidak tersedia di browser ini. Gunakan Chrome Android versi 137+ dan pastikan halaman dibuka sebagai tab HTTPS mandiri.', 'error');
+      connectBtn.classList.add('hidden');
+      return;
+    }
+    try {
+      const ports = await navigator.serial.getPorts();
+      if (ports.length === 1 && ports[0].connected !== false) {
+        await openPort(ports[0]);
+        setStatus('Izin RPP02N sudah tersimpan. Mencetak nota...', 'success');
+      } else if (ports.length === 1 && ports[0].connected === false) {
+        setStatus('Izin printer sudah tersimpan, tetapi RPP02N belum terhubung secara Bluetooth. Pastikan printer menyala dan dekat dengan HP, lalu tekan Hubungkan RPP02N.', 'error');
+        connectBtn.classList.remove('hidden');
+        if (!autoPrintStarted) {
+          autoPrintStarted = true;
+          await printTickets();
+        }
+      } else {
+        setStatus(ports.length > 1
+          ? 'Ada beberapa perangkat serial yang pernah diizinkan. Pilih RPP02N melalui tombol Hubungkan Printer.'
+          : 'Untuk penggunaan pertama, hubungkan printer RPP02N terlebih dahulu.', '');
+        connectBtn.classList.remove('hidden');
+      }
+    } catch (error) {
+      setStatus('Tidak dapat memeriksa izin printer: ' + (error.message || error), 'error');
+      connectBtn.classList.remove('hidden');
+    }
+  }
+
+  function receiveZeusData(event) {
+    if (event.source !== window.opener) return;
+    const message = event.data || {};
+    if (message.type !== 'ZEUS_PRINT_DATA' || message.channel !== CHANNEL) return;
+    if (noteReady) return;
+
+    try {
+      htmlReceived = String(message.html || '');
+      const tickets = sanitizeAndRender(htmlReceived);
+      noteReady = true;
+      setStatus('Nota diterima dari Zeus (' + tickets.length + ' lembar). Menyiapkan printer...', '');
+      prepareAndMaybePrint();
+    } catch (error) {
+      setStatus('Data nota tidak dapat dibaca: ' + (error.message || error), 'error');
+      sendResult(false, error.message || error);
+    }
+  }
+
+  connectBtn.addEventListener('click', connectAndPrint);
+  retryBtn.addEventListener('click', () => {
+    if (selectedPort && noteReady) printTickets();
+    else prepareAndMaybePrint();
+  });
+
+  if (!CHANNEL || !window.opener) {
+    setStatus('Halaman ini harus dibuka dari tombol Cetak Sekarang di Zeus. Tutup tab ini dan kembali ke Zeus.', 'error');
+  } else {
+    window.addEventListener('message', receiveZeusData);
+    // Pesan READY dikirim setelah listener dipasang. Channel acak mencegah data tertukar.
+    window.opener.postMessage({ type: 'ZEUS_PRINT_PAGE_READY', channel: CHANNEL }, '*');
+  }
+})();
+</script>
+</body>
+</html>
